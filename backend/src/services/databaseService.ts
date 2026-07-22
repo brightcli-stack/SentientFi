@@ -61,6 +61,7 @@ interface RebalanceHistoryRow {
     risk_alerts: string | null
     error: string | null
     details: string | null
+    event_source: string | null
 }
 
 // ─────────────────────────────────────────────
@@ -95,6 +96,7 @@ CREATE TABLE IF NOT EXISTS rebalance_history (
     risk_alerts   TEXT,
     error         TEXT,
     details       TEXT,
+    event_source  TEXT,
     FOREIGN KEY (portfolio_id) REFERENCES portfolios(id)
 );
 
@@ -263,7 +265,8 @@ function rowToEvent(row: RebalanceHistoryRow): RebalanceEvent {
         isAutomatic: row.is_automatic === 1,
         riskAlerts: safeJsonParse(row.risk_alerts, [], `event(${row.id}).risk_alerts`),
         error: row.error ?? undefined,
-        details: safeJsonParse(row.details, undefined, `event(${row.id}).details`)
+        details: safeJsonParse(row.details, undefined, `event(${row.id}).details`),
+        eventSource: (row.event_source as RebalanceEvent['eventSource']) ?? undefined
     }
 }
 
@@ -299,6 +302,12 @@ export class DatabaseService {
         if (!cols.some(c => c.name === 'version')) {
             this.db.exec("ALTER TABLE portfolios ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
             console.log('[DB] Migration: added version column to portfolios')
+        }
+
+        const historyCols = this.db.prepare("PRAGMA table_info(rebalance_history)").all() as Array<{ name: string }>
+        if (!historyCols.some(c => c.name === 'event_source')) {
+            this.db.exec("ALTER TABLE rebalance_history ADD COLUMN event_source TEXT")
+            console.log('[DB] Migration: added event_source column to rebalance_history')
         }
     }
 
@@ -523,8 +532,8 @@ export class DatabaseService {
 
             this.db.prepare(`
                 INSERT INTO rebalance_history
-                    (id, portfolio_id, timestamp, trigger, trades, gas_used, status, is_automatic, risk_alerts, error, details)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, portfolio_id, timestamp, trigger, trades, gas_used, status, is_automatic, risk_alerts, error, details, event_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `).run(
                 event.id,
                 event.portfolioId,
@@ -536,7 +545,8 @@ export class DatabaseService {
                 event.isAutomatic ? 1 : 0,
                 event.riskAlerts?.length ? JSON.stringify(event.riskAlerts) : null,
                 event.error ?? null,
-                event.details ? JSON.stringify(event.details) : null
+                event.details ? JSON.stringify(event.details) : null,
+                event.eventSource ?? null
             )
 
             return event
@@ -547,16 +557,32 @@ export class DatabaseService {
 
     getRebalanceHistory(portfolioId?: string, limit: number = 50, options?: RebalanceHistoryQueryOptions): RebalanceEvent[] {
         try {
+            const conditions: string[] = []
+            const params: (string | number)[] = []
+
             if (portfolioId) {
-                const rows = this.db.prepare<[string, number], RebalanceHistoryRow>(
-                    'SELECT * FROM rebalance_history WHERE portfolio_id = ? ORDER BY timestamp DESC LIMIT ?'
-                ).all(portfolioId, limit)
-                return rows.map(rowToEvent)
+                conditions.push('portfolio_id = ?')
+                params.push(portfolioId)
+            }
+            if (options?.eventSource) {
+                conditions.push('event_source = ?')
+                params.push(options.eventSource)
+            }
+            if (options?.startTimestamp) {
+                conditions.push('timestamp >= ?')
+                params.push(options.startTimestamp)
+            }
+            if (options?.endTimestamp) {
+                conditions.push('timestamp <= ?')
+                params.push(options.endTimestamp)
             }
 
-            const rows = this.db.prepare<[number], RebalanceHistoryRow>(
-                'SELECT * FROM rebalance_history ORDER BY timestamp DESC LIMIT ?'
-            ).all(limit)
+            const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+            params.push(limit)
+
+            const rows = this.db.prepare<(string | number)[], RebalanceHistoryRow>(
+                `SELECT * FROM rebalance_history ${whereClause} ORDER BY timestamp DESC LIMIT ?`
+            ).all(...params)
             return rows.map(rowToEvent)
         } catch (err) {
             throw new Error(`Failed to retrieve rebalance history${portfolioId ? ` for portfolio '${portfolioId}'` : ''
